@@ -1,5 +1,27 @@
 open Proofview.Notations
 
+let simple_string_of_ppcmds (c : Pp.t) : string =
+  let open Pp in
+  let buffer = Buffer.create 512 in
+  let rec aux f = function
+    | Ppcmd_empty -> ()
+    | Ppcmd_string s -> Printf.bprintf buffer "%s" s
+    | Ppcmd_glue cs -> List.iter (aux f) (List.map Pp.repr cs)
+    | Ppcmd_box (btype, c) ->
+      aux (
+        match btype with
+        | Pp_hbox -> false
+        | Pp_vbox _ -> true
+        | Pp_hvbox _ -> false
+        | Pp_hovbox _ -> false
+      ) (Pp.repr c)
+    | Ppcmd_tag (_, c) -> (aux f) (Pp.repr c)
+    | Ppcmd_print_break (n, _) -> Printf.bprintf buffer "%s" (if f then "\n" else String.make n ' ')
+    | Ppcmd_force_newline -> Printf.bprintf buffer "\n"
+    | Ppcmd_comment ss -> List.iter (Printf.bprintf buffer "%s") ss in
+  aux false (Pp.repr c);
+  buffer |> Buffer.to_bytes |> String.of_bytes
+
 let () = Mirage_crypto_rng_unix.initialize (module Mirage_crypto_rng.Fortuna)
 
 let client (type a) (url : string) (f : send:(string -> unit) -> receive:(unit -> string option) -> a) : a =
@@ -61,14 +83,17 @@ module Internal = struct
 
   let make (type a) (v : a) : a t = {v}
 
-  let to_yojson (type a) (v : a t) : Yojson.Safe.t =
+  let to_yojson (type a) _ (v : a t) : Yojson.Safe.t =
     let internal_id = new_internal_id () in
     internal_map := !internal_map |> InternalIdMap.add internal_id (Obj.magic v);
     [%to_yojson: repr] {internal_id = internal_id}
 
-  let of_yojson_exn (type a) (j : Yojson.Safe.t) : a t =
-    let repr = [%of_yojson: repr] j |> Result.get_ok in
+  let of_yojson (type a) _ (j : Yojson.Safe.t) : (a t, string) result =
+    [%of_yojson: repr] j |> Result.map @@ fun repr ->
     !internal_map |> InternalIdMap.find repr.internal_id |> Obj.magic
+
+  let of_yojson_exn (type a) f (j : Yojson.Safe.t) : a t =
+    of_yojson f j |> Result.get_ok
 end
 
 type external_id = int
@@ -78,42 +103,150 @@ module External = struct
   [@warning "-27"]
   type 'a t = {external_id : external_id}
     [@@deriving yojson { variants = `Internal "type"; exn = true }]
-
-  let to_yojson v = to_yojson (fun _ -> assert false) v
-  let of_yojson j = of_yojson (fun _ -> assert false) j
-  let of_yojson_exn j = of_yojson_exn (fun _ -> assert false) j
 end
 
+module ConstrRepr = struct
+  type t = EConstr.t Internal.t
+
+  let to_yojson v = Internal.to_yojson (fun _ -> assert false) v
+  let of_yojson j = Internal.of_yojson (fun _ -> assert false) j
+  let of_yojson_exn j = Internal.of_yojson_exn (fun _ -> assert false) j
+end
+
+module HypRepr = struct
+  type kind =
+    | Assumption
+    | Definition of {value : ConstrRepr.t}
+    [@@deriving yojson { variants = `Internal "type"; exn = true }]
+
+  type t = {
+    name : string;
+    type_ : ConstrRepr.t;
+    kind : kind;
+  } [@@deriving yojson { variants = `Internal "type"; exn = true }]
+end
+
+module GoalRepr = struct
+  type t = {
+    hyps : HypRepr.t list;
+    concl : ConstrRepr.t;
+  } [@@deriving yojson { variants = `Internal "type"; exn = true }]
+end
+
+module TacticRepr = struct
+  type 'a t = 'a Proofview.tactic Internal.t
+
+  let to_yojson f v = Internal.to_yojson f v
+  let of_yojson f j = Internal.of_yojson f j
+  let of_yojson_exn f j = Internal.of_yojson_exn f j
+end
+
+type _ type_desc =
+  | TypeDescUnit : unit type_desc
+  | TypeDescList : {element_type_desc : 'a type_desc} -> 'a list type_desc
+  | TypeDescInternal : 'a Internal.t type_desc
+  | TypeDescHyp : HypRepr.t type_desc
+  | TypeDescGoal : GoalRepr.t type_desc
+
+type any_type_desc = AnyTypeDesc : 'a type_desc -> any_type_desc
+
+let rec type_desc_to_yojson : type a. a type_desc -> Yojson.Safe.t = fun type_desc ->
+  match type_desc with
+  | TypeDescUnit ->
+    `Assoc ["type", `String "TypeDescUnit"]
+  | TypeDescList {element_type_desc} ->
+    let element_type_desc_j = type_desc_to_yojson element_type_desc in
+    `Assoc ["type", `String "TypeDescList"; "element_type_desc", element_type_desc_j]
+  | TypeDescInternal ->
+    `Assoc ["type", `String "TypeDescInternal"]
+  | TypeDescHyp ->
+    `Assoc ["type", `String "TypeDescHyp"]
+  | TypeDescGoal ->
+    `Assoc ["type", `String "TypeDescGoal"]
+let rec any_type_desc_of_yojson_exn (type_desc_j : Yojson.Safe.t) : any_type_desc =
+  match type_desc_j with
+  | `Assoc ["type", `String "TypeDescUnit"] ->
+    AnyTypeDesc TypeDescUnit
+  | `Assoc ["type", `String "TypeDescList"; "element_type_desc", element_type_desc_j] ->
+    let element_type_desc_any = any_type_desc_of_yojson_exn element_type_desc_j in
+    (match element_type_desc_any with
+    | AnyTypeDesc element_type_desc ->
+      AnyTypeDesc (TypeDescList {element_type_desc}))
+  | `Assoc ["type", `String "TypeDescInternal"] ->
+    AnyTypeDesc TypeDescInternal
+  | `Assoc ["type", `String "TypeDescHyp"] ->
+    AnyTypeDesc TypeDescHyp
+  | `Assoc ["type", `String "TypeDescGoal"] ->
+    AnyTypeDesc TypeDescGoal
+  | _ -> failwith "unknown type desc"
+
+let rec any_to_yojson : type a. a type_desc -> a -> Yojson.Safe.t = fun type_desc any ->
+  match type_desc with
+  | TypeDescUnit ->
+    [%to_yojson: unit] any
+  | TypeDescList {element_type_desc} ->
+    [%to_yojson: 'a list] (any_to_yojson element_type_desc) any
+  | TypeDescInternal ->
+    Internal.to_yojson (fun _ -> assert false) any
+  | TypeDescHyp ->
+    HypRepr.to_yojson any
+  | TypeDescGoal ->
+    GoalRepr.to_yojson any
+let rec any_of_yojson : type a. a type_desc -> Yojson.Safe.t -> (a, string) result = fun type_desc any_j ->
+  match type_desc with
+  | TypeDescUnit ->
+    [%of_yojson: unit] any_j
+  | TypeDescList {element_type_desc} ->
+    [%of_yojson: 'a list] (any_of_yojson element_type_desc) any_j
+  | TypeDescInternal ->
+    Internal.of_yojson (fun _ -> assert false) any_j
+  | TypeDescHyp ->
+    HypRepr.of_yojson any_j
+  | TypeDescGoal ->
+    GoalRepr.of_yojson any_j
+let any_of_yojson_exn (type a) (type_desc : a type_desc) (any_j : Yojson.Safe.t) =
+  any_of_yojson type_desc any_j |> Result.get_ok
+
 type (_, _) local_request_aux =
-  | LocalRequestUnit :
-    (unit Internal.t, unit) local_request_aux
+  | LocalRequestConstrPrint :
+    {
+      constr : ConstrRepr.t;
+    } -> (string, unit) local_request_aux
   | LocalRequestTacticReturn :
     {
-      value : 'a Internal.t;
-    } -> ('a Proofview.tactic Internal.t, 'a) local_request_aux
+      type_desc : 'a type_desc;
+      value : 'a;
+    } -> ('a TacticRepr.t, 'a) local_request_aux
   | LocalRequestTacticBind :
     {
-      tac : 'a Proofview.tactic Internal.t;
-      f : ('a Internal.t -> 'b Proofview.tactic Internal.t) External.t;
-    } -> ('b Proofview.tactic Internal.t, unit) local_request_aux
+      type_desc : 'a type_desc;
+      tac : 'a TacticRepr.t;
+      f : ('a -> 'b TacticRepr.t) External.t;
+    } -> ('b TacticRepr.t, unit) local_request_aux
   | LocalRequestTacticThen :
     {
-      tac_1 : unit Proofview.tactic Internal.t;
-      tac_2 : 'a Proofview.tactic Internal.t;
-    } -> ('a Proofview.tactic Internal.t, unit) local_request_aux
+      tac_1 : unit TacticRepr.t;
+      tac_2 : 'a TacticRepr.t;
+    } -> ('a TacticRepr.t, unit) local_request_aux
   | LocalRequestTacticOr :
     {
-      tac_1 : 'a Proofview.tactic Internal.t;
-      tac_2 : 'a Proofview.tactic Internal.t;
-    } -> ('a Proofview.tactic Internal.t, unit) local_request_aux
+      tac_1 : 'a TacticRepr.t;
+      tac_2 : 'a TacticRepr.t;
+    } -> ('a TacticRepr.t, unit) local_request_aux
+  | LocalRequestTacticGoals :
+    (GoalRepr.t list TacticRepr.t, unit) local_request_aux
+  | LocalRequestTacticDispatch :
+    {
+      tacs : 'a TacticRepr.t list;
+    } -> ('a list TacticRepr.t, 'a) local_request_aux
   | LocalRequestTacticMessage :
     {
       msg : string;
-    } -> (unit Proofview.tactic Internal.t, unit) local_request_aux
+    } -> (unit TacticRepr.t, unit) local_request_aux
   | LocalRequestTacticLtac :
     {
       tactic : string;
-    } -> (unit Proofview.tactic Internal.t, unit) local_request_aux
+    } -> (unit TacticRepr.t, unit) local_request_aux
 
 type _ local_request = LocalRequest : ('r, 'a) local_request_aux -> 'r local_request
 
@@ -121,23 +254,35 @@ type any_local_request = AnyLocalRequest : 'r local_request -> any_local_request
 
 let any_local_request_of_yojson_exn (local_request_j : Yojson.Safe.t) : any_local_request =
   match local_request_j with
-  | `Assoc ["type", `String "LocalRequestUnit"] ->
-    AnyLocalRequest (LocalRequest LocalRequestUnit)
-  | `Assoc ["type", `String "LocalRequestTacticReturn"; "value", value_j] ->
-    let value = Internal.of_yojson_exn value_j in
-    AnyLocalRequest (LocalRequest (LocalRequestTacticReturn {value}))
-  | `Assoc ["type", `String "LocalRequestTacticBind"; "tac", tac_j; "f", f_j] ->
-    let tac = Internal.of_yojson_exn tac_j in
-    let f = External.of_yojson_exn f_j in
-    AnyLocalRequest (LocalRequest (LocalRequestTacticBind {tac; f}))
+  | `Assoc ["type", `String "LocalRequestConstrPrint"; "constr", constr_j] ->
+    let constr = Internal.of_yojson_exn (fun _ -> assert false) constr_j in
+    AnyLocalRequest (LocalRequest (LocalRequestConstrPrint {constr}))
+  | `Assoc ["type", `String "LocalRequestTacticReturn"; "type_desc", type_desc_j; "value", value_j] ->
+    let any_type_desc = any_type_desc_of_yojson_exn type_desc_j in
+    (match any_type_desc with
+    | AnyTypeDesc type_desc ->
+      let value = any_of_yojson_exn type_desc value_j in
+      AnyLocalRequest (LocalRequest (LocalRequestTacticReturn {type_desc; value})))
+  | `Assoc ["type", `String "LocalRequestTacticBind"; "type_desc", type_desc_j; "tac", tac_j; "f", f_j] ->
+    let any_type_desc = any_type_desc_of_yojson_exn type_desc_j in
+    (match any_type_desc with
+    | AnyTypeDesc type_desc ->
+      let tac = Internal.of_yojson_exn (fun _ -> assert false) tac_j in
+      let f = External.of_yojson_exn (fun _ -> assert false) f_j in
+      AnyLocalRequest (LocalRequest (LocalRequestTacticBind {type_desc; tac; f})))
   | `Assoc ["type", `String "LocalRequestTacticThen"; "tac_1", tac_1_j; "tac_2", tac_2_j] ->
-    let tac_1 = Internal.of_yojson_exn tac_1_j in
-    let tac_2 = Internal.of_yojson_exn tac_2_j in
+    let tac_1 = Internal.of_yojson_exn (fun _ -> assert false) tac_1_j in
+    let tac_2 = Internal.of_yojson_exn (fun _ -> assert false) tac_2_j in
     AnyLocalRequest (LocalRequest (LocalRequestTacticThen {tac_1; tac_2}))
   | `Assoc ["type", `String "LocalRequestTacticOr"; "tac_1", tac_1_j; "tac_2", tac_2_j] ->
-    let tac_1 = Internal.of_yojson_exn tac_1_j in
-    let tac_2 = Internal.of_yojson_exn tac_2_j in
+    let tac_1 = Internal.of_yojson_exn (fun _ -> assert false) tac_1_j in
+    let tac_2 = Internal.of_yojson_exn (fun _ -> assert false) tac_2_j in
     AnyLocalRequest (LocalRequest (LocalRequestTacticOr {tac_1; tac_2}))
+  | `Assoc ["type", `String "LocalRequestTacticGoals"] ->
+    AnyLocalRequest (LocalRequest LocalRequestTacticGoals)
+  | `Assoc ["type", `String "LocalRequestTacticDispatch"; "tacs", tacs_j] ->
+    let tacs = [%of_yojson: 'a TacticRepr.t list] (fun _ -> assert false) tacs_j |> Result.get_ok in
+    AnyLocalRequest (LocalRequest (LocalRequestTacticDispatch {tacs}))
   | `Assoc ["type", `String "LocalRequestTacticMessage"; "msg", msg_j] ->
     let msg = [%of_yojson: string] msg_j |> Result.get_ok in
     AnyLocalRequest (LocalRequest (LocalRequestTacticMessage {msg}))
@@ -148,46 +293,52 @@ let any_local_request_of_yojson_exn (local_request_j : Yojson.Safe.t) : any_loca
 
 let local_request_result_to_yojson (type r) (local_request : r local_request) (result : r) : Yojson.Safe.t =
   match local_request with
-  | LocalRequest LocalRequestUnit ->
-    Internal.to_yojson result
+  | LocalRequest (LocalRequestConstrPrint _) ->
+    [%to_yojson: string] result
   | LocalRequest (LocalRequestTacticReturn _) ->
-    Internal.to_yojson result
+    Internal.to_yojson (fun _ -> assert false) result
   | LocalRequest (LocalRequestTacticBind _) ->
-    Internal.to_yojson result
+    Internal.to_yojson (fun _ -> assert false) result
   | LocalRequest (LocalRequestTacticThen _) ->
-    Internal.to_yojson result
+    Internal.to_yojson (fun _ -> assert false) result
   | LocalRequest (LocalRequestTacticOr _) ->
-    Internal.to_yojson result
+    Internal.to_yojson (fun _ -> assert false) result
+  | LocalRequest LocalRequestTacticGoals ->
+    Internal.to_yojson (fun _ -> assert false) result
+  | LocalRequest (LocalRequestTacticDispatch _) ->
+    Internal.to_yojson (fun _ -> assert false) result
   | LocalRequest (LocalRequestTacticMessage _) ->
-    Internal.to_yojson result
+    Internal.to_yojson (fun _ -> assert false) result
   | LocalRequest (LocalRequestTacticLtac _) ->
-    Internal.to_yojson result
+    Internal.to_yojson (fun _ -> assert false) result
 
 
 type _ remote_request =
   | RemoteRequestApplyFunction :
     {
-      f : ('a Internal.t -> 'b Internal.t) External.t;
-      x : 'a Internal.t;
+      type_desc : 'a type_desc;
+      f : ('a -> 'b Internal.t) External.t;
+      x : 'a;
     } -> 'b Internal.t remote_request
   | RemoteRequestGetTactic :
-    unit Proofview.tactic Internal.t remote_request
+    unit TacticRepr.t remote_request
 
 let remote_request_to_yojson (type r) (remote_request : r remote_request) : Yojson.Safe.t =
   match remote_request with
-  | RemoteRequestApplyFunction {f; x} ->
-    let f_j = External.to_yojson f in
-    let x_j = Internal.to_yojson x in
-    `Assoc ["type", `String "RemoteRequestApplyFunction"; "f", f_j; "x", x_j]
+  | RemoteRequestApplyFunction {type_desc; f; x} ->
+    let type_desc_j = type_desc_to_yojson type_desc in
+    let f_j = External.to_yojson (fun _ -> assert false) f in
+    let x_j = any_to_yojson type_desc x in
+    `Assoc ["type", `String "RemoteRequestApplyFunction"; "type_desc", type_desc_j; "f", f_j; "x", x_j]
   | RemoteRequestGetTactic ->
     `Assoc ["type", `String "RemoteRequestGetTactic"]
 
 let remote_request_result_of_yojson_exn (type r) (remote_request : r remote_request) (result_j : Yojson.Safe.t) : r =
   match remote_request with
   | RemoteRequestApplyFunction _ ->
-    Internal.of_yojson_exn result_j
+    Internal.of_yojson_exn (fun _ -> assert false) result_j
   | RemoteRequestGetTactic ->
-    Internal.of_yojson_exn result_j
+    Internal.of_yojson_exn (fun _ -> assert false) result_j
 
 exception RemoteException of string
 
@@ -225,15 +376,17 @@ let interact (ist : Geninterp.interp_sign) (url : string) : unit Proofview.tacti
       aux () in
     let handle_local_request (type r) (local_request : r local_request) : r =
       match local_request with
-      | LocalRequest LocalRequestUnit ->
-        Internal.make ()
-      | LocalRequest (LocalRequestTacticReturn {value}) ->
-        Internal.make (Proofview.tclUNIT value.v)
-      | LocalRequest (LocalRequestTacticBind {tac; f}) ->
+      | LocalRequest (LocalRequestConstrPrint {constr}) ->
+        let env = Global.env () in
+        let sigma = Evd.from_env env in
+        simple_string_of_ppcmds (Printer.pr_econstr_env env sigma constr.v)
+      | LocalRequest (LocalRequestTacticReturn {type_desc = _; value}) ->
+        Internal.make (Proofview.tclUNIT value)
+      | LocalRequest (LocalRequestTacticBind {type_desc; tac; f}) ->
         Internal.make (
           tac.v >>= fun x ->
           Proofview.wrap_exceptions (fun () ->
-            (handle_remote_request (RemoteRequestApplyFunction {f; x = Internal.make x})).v
+            (handle_remote_request (RemoteRequestApplyFunction {type_desc; f; x})).v
           )
         )
       | LocalRequest (LocalRequestTacticThen {tac_1; tac_2}) ->
@@ -242,6 +395,36 @@ let interact (ist : Geninterp.interp_sign) (url : string) : unit Proofview.tacti
         Internal.make (tac_1.v <+> tac_2.v)
       | LocalRequest (LocalRequestTacticMessage {msg}) ->
         Internal.make (Proofview.tclLIFT (Proofview.NonLogical.print_info (Pp.str msg)))
+      | LocalRequest LocalRequestTacticGoals ->
+        Internal.make (
+          Proofview.Goal.goals >>= fun goals ->
+          Proofview.Monad.List.map Fun.id goals >>= fun goals ->
+          Proofview.tclUNIT (
+            goals |> List.map (fun goal ->
+              {
+                GoalRepr.hyps =
+                  goal |> Proofview.Goal.hyps |> List.map (
+                    let open Context.Named.Declaration in function
+                    | LocalAssum (name, type_) ->
+                      {
+                        HypRepr.name = name.binder_name |> Names.Id.to_string;
+                        HypRepr.type_ = Internal.make type_;
+                        HypRepr.kind = Assumption;
+                      }
+                    | LocalDef (name, value, type_) ->
+                      {
+                        HypRepr.name = name.binder_name |> Names.Id.to_string;
+                        HypRepr.type_ = Internal.make type_;
+                        HypRepr.kind = Definition {value = Internal.make value};
+                      }
+                  );
+                GoalRepr.concl = Internal.make (goal |> Proofview.Goal.concl);
+              }
+            )
+          )
+        )
+      | LocalRequest (LocalRequestTacticDispatch {tacs}) ->
+        Internal.make (Proofview.tclDISPATCHL (tacs |> List.map (fun tac -> tac.Internal.v)))
       | LocalRequest (LocalRequestTacticLtac {tactic}) ->
         Internal.make (
           Proofview.tclENV >>= fun env ->
