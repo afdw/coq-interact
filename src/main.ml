@@ -148,6 +148,15 @@ let remote_request_result_of_yojson_exn (type r) (remote_request : r remote_requ
   | RemoteRequestGetTactic ->
     Internal.of_yojson_exn result_j
 
+exception RemoteException of string
+
+let _ =
+  let pr = function
+  | RemoteException s -> Some ("RemoteException:\n" ^ s)
+  | _ -> None
+  in
+  Printexc.register_printer pr
+
 let interact (url : string) : unit Proofview.tactic =
   client url (fun ~send ~receive ->
     let handle_local = ref (fun _ -> assert false) in
@@ -165,6 +174,12 @@ let interact (url : string) : unit Proofview.tactic =
           | _ when s |> String.starts_with ~prefix:"<- " ->
             let t = String.sub s 3 ((String.length s) - 3) in
             remote_request_result_of_yojson_exn remote_request (Yojson.Safe.from_string t)
+          | _ when s |> String.starts_with ~prefix:"!! " ->
+            let t = String.sub s 3 ((String.length s) - 3) in
+            (match Yojson.Safe.from_string t with
+            | `String e -> raise (RemoteException e)
+            | _ -> CErrors.user_err Pp.(str "Invalid exception contents: " ++ str s)
+            )
           | _ -> CErrors.user_err Pp.(str "Invalid message: " ++ str s) in
       aux () in
     let handle_local_request (type r) (local_request : r local_request) : r =
@@ -174,12 +189,21 @@ let interact (url : string) : unit Proofview.tactic =
       | LocalRequest (LocalRequestTacticReturn {value}) ->
         Internal.make (Proofview.tclUNIT value.v)
       | LocalRequest (LocalRequestTacticBind {tac; f}) ->
-        Internal.make (tac.v >>= (fun x -> (handle_remote_request (RemoteRequestApplyFunction {f; x = Internal.make x})).v)) in
+        Internal.make (
+          tac.v >>= fun x ->
+          Proofview.wrap_exceptions (fun () ->
+            (handle_remote_request (RemoteRequestApplyFunction {f; x = Internal.make x})).v
+          )
+        ) in
     handle_local := (fun t ->
       let any_local_request = any_local_request_of_yojson_exn (Yojson.Safe.from_string t) in
       match any_local_request with
       | AnyLocalRequest local_request ->
-        let result = handle_local_request local_request in
-        send ("<- " ^ Yojson.Safe.to_string (local_request_result_to_yojson local_request result)));
+        try
+          let result = handle_local_request local_request in
+          send ("<- " ^ Yojson.Safe.to_string (local_request_result_to_yojson local_request result))
+        with exn when CErrors.noncritical exn ->
+          send ("!! " ^ Yojson.Safe.to_string (`String (CErrors.print exn |> Pp.string_of_ppcmds)))
+    );
     (handle_remote_request RemoteRequestGetTactic).v
   )
