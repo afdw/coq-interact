@@ -110,6 +110,10 @@ type (_, _) local_request_aux =
     {
       msg : string;
     } -> (unit Proofview.tactic Internal.t, unit) local_request_aux
+  | LocalRequestTacticLtac :
+    {
+      tactic : string;
+    } -> (unit Proofview.tactic Internal.t, unit) local_request_aux
 
 type _ local_request = LocalRequest : ('r, 'a) local_request_aux -> 'r local_request
 
@@ -137,6 +141,9 @@ let any_local_request_of_yojson_exn (local_request_j : Yojson.Safe.t) : any_loca
   | `Assoc ["type", `String "LocalRequestTacticMessage"; "msg", msg_j] ->
     let msg = [%of_yojson: string] msg_j |> Result.get_ok in
     AnyLocalRequest (LocalRequest (LocalRequestTacticMessage {msg}))
+  | `Assoc ["type", `String "LocalRequestTacticLtac"; "tactic", tactic_j] ->
+    let tactic = [%of_yojson: string] tactic_j |> Result.get_ok in
+    AnyLocalRequest (LocalRequest (LocalRequestTacticLtac {tactic}))
   | _ -> failwith "unknown local request"
 
 let local_request_result_to_yojson (type r) (local_request : r local_request) (result : r) : Yojson.Safe.t =
@@ -153,6 +160,9 @@ let local_request_result_to_yojson (type r) (local_request : r local_request) (r
     Internal.to_yojson result
   | LocalRequest (LocalRequestTacticMessage _) ->
     Internal.to_yojson result
+  | LocalRequest (LocalRequestTacticLtac _) ->
+    Internal.to_yojson result
+
 
 type _ remote_request =
   | RemoteRequestApplyFunction :
@@ -188,7 +198,7 @@ let _ =
   in
   Printexc.register_printer pr
 
-let interact (url : string) : unit Proofview.tactic =
+let interact (ist : Geninterp.interp_sign) (url : string) : unit Proofview.tactic =
   client url (fun ~send ~receive ->
     let handle_local = ref (fun _ -> assert false) in
     let handle_remote_request (type r) (remote_request : r remote_request) : r =
@@ -231,7 +241,15 @@ let interact (url : string) : unit Proofview.tactic =
       | LocalRequest (LocalRequestTacticOr {tac_1; tac_2}) ->
         Internal.make (tac_1.v <+> tac_2.v)
       | LocalRequest (LocalRequestTacticMessage {msg}) ->
-        Internal.make (Proofview.tclLIFT (Proofview.NonLogical.print_info (Pp.str msg))) in
+        Internal.make (Proofview.tclLIFT (Proofview.NonLogical.print_info (Pp.str msg)))
+      | LocalRequest (LocalRequestTacticLtac {tactic}) ->
+        Internal.make (
+          Proofview.tclENV >>= fun env ->
+          let raw_tac = Pcoq.parse_string Ltac_plugin.Pltac.tactic_eoi tactic in
+          let glob_tac = Ltac_plugin.Tacintern.intern_pure_tactic (Genintern.empty_glob_sign ~strict:false env) raw_tac in
+          let tac = Ltac_plugin.Tacinterp.eval_tactic_ist ist glob_tac in
+          tac
+        ) in
     handle_local := (fun t ->
       let any_local_request = any_local_request_of_yojson_exn (Yojson.Safe.from_string t) in
       match any_local_request with
