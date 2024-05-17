@@ -96,6 +96,16 @@ type (_, _) local_request_aux =
       tac : 'a Proofview.tactic Internal.t;
       f : ('a Internal.t -> 'b Proofview.tactic Internal.t) External.t;
     } -> ('b Proofview.tactic Internal.t, unit) local_request_aux
+  | LocalRequestTacticThen :
+    {
+      tac_1 : unit Proofview.tactic Internal.t;
+      tac_2 : 'a Proofview.tactic Internal.t;
+    } -> ('a Proofview.tactic Internal.t, unit) local_request_aux
+  | LocalRequestTacticOr :
+    {
+      tac_1 : 'a Proofview.tactic Internal.t;
+      tac_2 : 'a Proofview.tactic Internal.t;
+    } -> ('a Proofview.tactic Internal.t, unit) local_request_aux
   | LocalRequestTacticMessage :
     {
       msg : string;
@@ -116,6 +126,14 @@ let any_local_request_of_yojson_exn (local_request_j : Yojson.Safe.t) : any_loca
     let tac = Internal.of_yojson_exn tac_j in
     let f = External.of_yojson_exn f_j in
     AnyLocalRequest (LocalRequest (LocalRequestTacticBind {tac; f}))
+  | `Assoc ["type", `String "LocalRequestTacticThen"; "tac_1", tac_1_j; "tac_2", tac_2_j] ->
+    let tac_1 = Internal.of_yojson_exn tac_1_j in
+    let tac_2 = Internal.of_yojson_exn tac_2_j in
+    AnyLocalRequest (LocalRequest (LocalRequestTacticThen {tac_1; tac_2}))
+  | `Assoc ["type", `String "LocalRequestTacticOr"; "tac_1", tac_1_j; "tac_2", tac_2_j] ->
+    let tac_1 = Internal.of_yojson_exn tac_1_j in
+    let tac_2 = Internal.of_yojson_exn tac_2_j in
+    AnyLocalRequest (LocalRequest (LocalRequestTacticOr {tac_1; tac_2}))
   | `Assoc ["type", `String "LocalRequestTacticMessage"; "msg", msg_j] ->
     let msg = [%of_yojson: string] msg_j |> Result.get_ok in
     AnyLocalRequest (LocalRequest (LocalRequestTacticMessage {msg}))
@@ -128,6 +146,10 @@ let local_request_result_to_yojson (type r) (local_request : r local_request) (r
   | LocalRequest (LocalRequestTacticReturn _) ->
     Internal.to_yojson result
   | LocalRequest (LocalRequestTacticBind _) ->
+    Internal.to_yojson result
+  | LocalRequest (LocalRequestTacticThen _) ->
+    Internal.to_yojson result
+  | LocalRequest (LocalRequestTacticOr _) ->
     Internal.to_yojson result
   | LocalRequest (LocalRequestTacticMessage _) ->
     Internal.to_yojson result
@@ -204,6 +226,10 @@ let interact (url : string) : unit Proofview.tactic =
             (handle_remote_request (RemoteRequestApplyFunction {f; x = Internal.make x})).v
           )
         )
+      | LocalRequest (LocalRequestTacticThen {tac_1; tac_2}) ->
+        Internal.make (tac_1.v <*> tac_2.v)
+      | LocalRequest (LocalRequestTacticOr {tac_1; tac_2}) ->
+        Internal.make (tac_1.v <+> tac_2.v)
       | LocalRequest (LocalRequestTacticMessage {msg}) ->
         Internal.make (Proofview.tclLIFT (Proofview.NonLogical.print_info (Pp.str msg))) in
     handle_local := (fun t ->
