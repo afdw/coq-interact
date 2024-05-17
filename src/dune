@@ -1,0 +1,8 @@
+(library
+ (name coq_interact)
+ (public_name coq-interact.plugin)
+ (libraries coq-core.vernac coq-core.plugins.ltac yojson lwt websocket-lwt-unix mirage-crypto-rng.unix)
+ (preprocess (pps ppx_deriving_yojson)))
+
+(coq.pp
+ (modules syntax))

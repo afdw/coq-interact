@@ -1,0 +1,4 @@
+(coq.theory
+ (name CoqInteract)
+ (package coq-interact)
+ (plugins coq-interact.plugin))

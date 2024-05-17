@@ -1,0 +1,11 @@
+DECLARE PLUGIN "coq-interact.plugin"
+
+{
+  open Stdarg
+  open Ltac_plugin
+}
+
+TACTIC EXTEND hello_world_tactic
+| [ "interact" string(url) ] ->
+  { Main.interact url }
+END
