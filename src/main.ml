@@ -96,6 +96,10 @@ type (_, _) local_request_aux =
       tac : 'a Proofview.tactic Internal.t;
       f : ('a Internal.t -> 'b Proofview.tactic Internal.t) External.t;
     } -> ('b Proofview.tactic Internal.t, unit) local_request_aux
+  | LocalRequestTacticMessage :
+    {
+      msg : string;
+    } -> (unit Proofview.tactic Internal.t, unit) local_request_aux
 
 type _ local_request = LocalRequest : ('r, 'a) local_request_aux -> 'r local_request
 
@@ -112,6 +116,9 @@ let any_local_request_of_yojson_exn (local_request_j : Yojson.Safe.t) : any_loca
     let tac = Internal.of_yojson_exn tac_j in
     let f = External.of_yojson_exn f_j in
     AnyLocalRequest (LocalRequest (LocalRequestTacticBind {tac; f}))
+  | `Assoc ["type", `String "LocalRequestTacticMessage"; "msg", msg_j] ->
+    let msg = [%of_yojson: string] msg_j |> Result.get_ok in
+    AnyLocalRequest (LocalRequest (LocalRequestTacticMessage {msg}))
   | _ -> failwith "unknown local request"
 
 let local_request_result_to_yojson (type r) (local_request : r local_request) (result : r) : Yojson.Safe.t =
@@ -121,6 +128,8 @@ let local_request_result_to_yojson (type r) (local_request : r local_request) (r
   | LocalRequest (LocalRequestTacticReturn _) ->
     Internal.to_yojson result
   | LocalRequest (LocalRequestTacticBind _) ->
+    Internal.to_yojson result
+  | LocalRequest (LocalRequestTacticMessage _) ->
     Internal.to_yojson result
 
 type _ remote_request =
@@ -194,7 +203,9 @@ let interact (url : string) : unit Proofview.tactic =
           Proofview.wrap_exceptions (fun () ->
             (handle_remote_request (RemoteRequestApplyFunction {f; x = Internal.make x})).v
           )
-        ) in
+        )
+      | LocalRequest (LocalRequestTacticMessage {msg}) ->
+        Internal.make (Proofview.tclLIFT (Proofview.NonLogical.print_info (Pp.str msg))) in
     handle_local := (fun t ->
       let any_local_request = any_local_request_of_yojson_exn (Yojson.Safe.from_string t) in
       match any_local_request with
