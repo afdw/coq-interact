@@ -233,6 +233,10 @@ type (_, _) local_request_aux =
       tac_1 : 'a TacticRepr.t;
       tac_2 : 'a TacticRepr.t;
     } -> ('a TacticRepr.t, unit) local_request_aux
+  | LocalRequestTacticComplete :
+    {
+      tac : 'a TacticRepr.t;
+    } -> ('a TacticRepr.t, unit) local_request_aux
   | LocalRequestTacticGoals :
     (GoalRepr.t list TacticRepr.t, unit) local_request_aux
   | LocalRequestTacticDispatch :
@@ -278,6 +282,9 @@ let any_local_request_of_yojson_exn (local_request_j : Yojson.Safe.t) : any_loca
     let tac_1 = Internal.of_yojson_exn (fun _ -> assert false) tac_1_j in
     let tac_2 = Internal.of_yojson_exn (fun _ -> assert false) tac_2_j in
     AnyLocalRequest (LocalRequest (LocalRequestTacticOr {tac_1; tac_2}))
+  | `Assoc ["type", `String "LocalRequestTacticComplete"; "tac", tac_j] ->
+    let tac = Internal.of_yojson_exn (fun _ -> assert false) tac_j in
+    AnyLocalRequest (LocalRequest (LocalRequestTacticComplete {tac}))
   | `Assoc ["type", `String "LocalRequestTacticGoals"] ->
     AnyLocalRequest (LocalRequest LocalRequestTacticGoals)
   | `Assoc ["type", `String "LocalRequestTacticDispatch"; "tacs", tacs_j] ->
@@ -302,6 +309,8 @@ let local_request_result_to_yojson (type r) (local_request : r local_request) (r
   | LocalRequest (LocalRequestTacticThen _) ->
     Internal.to_yojson (fun _ -> assert false) result
   | LocalRequest (LocalRequestTacticOr _) ->
+    Internal.to_yojson (fun _ -> assert false) result
+  | LocalRequest (LocalRequestTacticComplete _) ->
     Internal.to_yojson (fun _ -> assert false) result
   | LocalRequest LocalRequestTacticGoals ->
     Internal.to_yojson (fun _ -> assert false) result
@@ -393,6 +402,8 @@ let interact (ist : Geninterp.interp_sign) (url : string) : unit Proofview.tacti
         Internal.make (tac_1.v <*> tac_2.v)
       | LocalRequest (LocalRequestTacticOr {tac_1; tac_2}) ->
         Internal.make (tac_1.v <+> tac_2.v)
+      | LocalRequest (LocalRequestTacticComplete {tac}) ->
+        Internal.make (Tacticals.tclCOMPLETE tac.v)
       | LocalRequest (LocalRequestTacticMessage {msg}) ->
         Internal.make (Proofview.tclLIFT (Proofview.NonLogical.print_info (Pp.str msg)))
       | LocalRequest LocalRequestTacticGoals ->
@@ -428,10 +439,12 @@ let interact (ist : Geninterp.interp_sign) (url : string) : unit Proofview.tacti
       | LocalRequest (LocalRequestTacticLtac {tactic}) ->
         Internal.make (
           Proofview.tclENV >>= fun env ->
-          let raw_tac = Pcoq.parse_string Ltac_plugin.Pltac.tactic_eoi tactic in
-          let glob_tac = Ltac_plugin.Tacintern.intern_pure_tactic (Genintern.empty_glob_sign ~strict:false env) raw_tac in
-          let tac = Ltac_plugin.Tacinterp.eval_tactic_ist ist glob_tac in
-          tac
+          Proofview.wrap_exceptions (fun () ->
+            let raw_tac = Pcoq.parse_string Ltac_plugin.Pltac.tactic_eoi tactic in
+            let glob_tac = Ltac_plugin.Tacintern.intern_pure_tactic (Genintern.empty_glob_sign ~strict:false env) raw_tac in
+            let tac = Ltac_plugin.Tacinterp.eval_tactic_ist ist glob_tac in
+            tac
+          )
         ) in
     handle_local := (fun t ->
       let any_local_request = any_local_request_of_yojson_exn (Yojson.Safe.from_string t) in
